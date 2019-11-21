@@ -1,0 +1,112 @@
+from netmiko import *
+import logging
+from paramiko import SSHException
+import getpass
+
+hostname = ""
+ip = ""
+connection = None
+
+
+def connectiontype():
+    while 1:
+        con_type = input("SSH or Telnet? [SSH]") or 'SSH'
+        if con_type.lower() == 'telnet' or con_type.lower() == 'ssh':
+            if con_type.lower() == 'telnet':
+                con_type = 'telnet'
+                break
+            elif con_type.lower() == 'ssh':
+                break
+        else:
+            continue
+    return con_type.lower()
+
+
+def main():
+    global hostname
+    global ip
+    global connection
+    con_type = connectiontype()
+    logfile = input("Enter logfile name: [cisco.log]") or 'cisco.log'
+    logging.basicConfig(filename=logfile, level=logging.DEBUG)
+    iplist = input("Enter IP List file name: [iplist.txt]") or 'iplist.txt'
+    user = input("Enter your username: [admin]") or 'admin'
+    passwd = getpass.getpass(prompt='Password:')
+    secret = getpass.getpass(prompt='Secret:')
+    loopback_ip = 151  # start IP to give loopback .X [151-254]
+    print("\nAutomating...\n")
+    ips = open(iplist, 'r')
+    for ip in ips:
+
+        # Connection Handling
+        try:
+            if con_type == 'ssh':
+                connection = ConnectHandler(device_type='cisco_ios', host=ip, username=user, password=passwd,
+                                            secret=secret)
+            else:
+                connection = ConnectHandler(device_type='cisco_ios_telnet', host=ip, username=user, password=passwd,
+                                            secret=secret)
+            connection.enable()
+            hostname = connection.send_command("show run | inc hostname")
+        except (NetMikoTimeoutException, TimeoutError):
+            logging.error("[+] Failed: [IP]: %s (Reason: Connection Timedout)" % ip.strip('\n'))
+            print("[+] Failed: [IP]: %s (Reason: Connection Timedout)" % ip.strip('\n'))
+            continue
+        except NetMikoAuthenticationException:
+            logging.error("[+] Failed: [IP]: %s (Reason: Authentication Error)" % ip.strip('\n'))
+            print("[+] Failed: [IP]: %s (Reason: Authentication Error)" % ip.strip('\n'))
+            continue
+        except ValueError as secreterror:
+            if 'Failed to enter enable mode.' in str(secreterror):
+                logging.error("[+] Failed: [IP]: %s (Reason: Wrong Secret)" % ip.strip('\n'))
+                print("[+] Failed: [IP]: %s (Reason: Wrong Secret)" % ip.strip('\n'))
+                continue
+            else:
+                logging.error("[+] Generic Error, check logs")
+                print("[+] Generic Error, check logs")
+                continue
+        except SSHException:
+            logging.error("[+] Failed: [IP]: %s (Reason: SSH Connection error)" % ip.strip('\n'))
+            print("[+] Failed: [IP]: %s (Reason: SSH Connection error)" % ip.strip('\n'))
+            continue
+        except ConnectionRefusedError:
+            logging.error("[+] Failed: [IP]: %s (Reason: Connection Refused)" % ip.strip('\n'))
+            print("[+] Failed: [IP]: %s (Reason: Connection Refused)" % ip.strip('\n'))
+            continue
+        except ConnectionAbortedError:
+            logging.error("[+] Failed: [IP]: %s (Reason: Software error)" % ip.strip('\n'))
+            print("[+] Failed: [IP]: %s (Reason: Software Error)" % ip.strip('\n'))
+            continue
+
+        # Code execution starts here when connection establishes
+        if hostname:
+            count = 0
+            print("[+] Connected [%s][%s]" % (hostname.split()[1], ip.strip('\n')))
+            check_loopback = connection.send_command('show running-config interface Loopback 0 | inc address').split()[2]
+            if '172' not in check_loopback:
+                config_cmds = ['int loopback 0', 'ip address 172.16.100.' + str(loopback_ip) + ' 255.255.255.0']
+                connection.send_config_set(config_cmds)
+                loopback_ip += 1
+                check_loopback = \
+                    connection.send_command('show running-config interface Loopback 0 | inc address').split()[2]
+                print("[" + ip.strip('\n') + "] New Loopback: " + check_loopback)
+            else:
+                print("[" + ip.strip('\n') + "] Loopback already set: " + check_loopback)
+            config_cmds = ['router ospf 1', 'router-id ' + check_loopback]
+            connection.send_config_set(config_cmds)
+            if '172' in connection.send_command('show running-config | inc router-id'):
+                print("[%s][Part1] OSPF Done." % ip.strip('\n'))
+            show_br = [word.split() for word in connection.send_command('show ip int br').split('\n') if word]
+            show_br.pop(0)
+            for iterate in show_br:
+                if 'unassigned' not in iterate[1] and 'loopback' not in iterate[0].lower():
+                    config_cmds = ['int ' + iterate[0], 'ip ospf 1 area 0']
+                    connection.send_config_set(config_cmds)
+                    count += 1
+            if connection.send_command('show running-config | inc ip ospf 1 area 0').count('ip ospf 1 area 0') == count:
+                print("[%s][Part2] OSPF Done." % ip.strip('\n'))
+            connection.send_command("wr")
+
+
+if __name__ == "__main__":
+    main()
